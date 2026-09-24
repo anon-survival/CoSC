@@ -624,8 +624,6 @@ def PIT_cond(args):
     print("KS-cal:", rmst_ksp_result_test[3].item())
     print("KM-cal:", rmst_ksp_result_test[4].item())
     print("IBS:", rmst_ksp_result_test[5].item())
-    # print("KS-sum:", rmst_ksp_result_test[6].item())
-    # print("KS-var:", rmst_ksp_result_test[7].item())
     print("PSR:", rmst_ksp_result_test[6].item())
     print("Cal_ws:", rmst_ksp_result_test[7].item())
 
