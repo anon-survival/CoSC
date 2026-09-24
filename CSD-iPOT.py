@@ -347,9 +347,6 @@ def CSD(args):
         quantile_prediction_test2 = np.insert(quantile_prediction_test2, 0, 0)
     assert np.all(quantile_prediction_test2 >= 0), "Quantile predictions contain negative."
     assert check_monotonicity(quantile_prediction_test2), "Quantile predictions are not monotonic."
-    # print("Quantile:", quantile_prediction_test2)
-    # t_train_val = np.concatenate((tte_train, tte_valid.cpu()))
-    # e_train_val = np.concatenate((is_dead_train, is_dead_valid.cpu()))
     end_time = time.time()
 
     evaler = QuantileRegEvaluator(quantile_prediction_test2, csd_quantile, tte_test, is_dead_test, tte_train, is_dead_train,
@@ -368,81 +365,14 @@ def CSD(args):
                                       cdf_test=torch.tensor(1-quan_to_surv).to(DEVICE), time=tte_test)
     PSR = util.cen_log_simple(tte=tte_test, is_dead=is_dead_test, cdf_matrix=torch.tensor(1-quan_to_surv).to(DEVICE))
 
-    if args.dataset in ['liver', 'stomach', 'bladder']:
-        labels_test = torch.load(f"./data/seer/{args.dataset}/{args.k}/{args.dataset}_test_labels.pt").to(DEVICE)
-        labels_test = labels_test[order_test]
-    else:
-        labels_test = torch.load(f"./data/{args.dataset}/{args.k}/{args.dataset}_test_labels.pt").to(DEVICE)
-        labels_test = labels_test[order_test]
-
-    KS_SUM, KS_VAR = util.groupwise_ks_metric(cdf=torch.tensor(1-surv_test).to(DEVICE), is_dead=is_dead_test, labels_test=labels_test)
-
     print("C-index:", C_index)
     print("S-cal(20):", S_cal.item())
     print("D-cal(20):", D_cal.item())
     print("KS-cal:", KS.item())
     print("KM-cal:", KM_cal.item())
     print("IBS:", IBS.item())
-    print("KS-sum:", KS_SUM.item())
-    print("KS-var:", KS_VAR.item())
     print("PSR:", PSR.item())
     print("CSD-iPOT time:", end_time - start_time)
-    # workbook = load_workbook(filename='./ksp_time.xlsx')
-    # sheet = workbook.active
-    # last_row = sheet.max_row
-    # sheet.cell(row=last_row+1, column=1, value=(end_time - start_time))
-    # sheet.cell(row=last_row+1, column=2, value=(f'CSD-iPOT_{args.dataset}_{args.model_dist}'))
-    # workbook.save('./ksp_time.xlsx')
-
-    workbook = load_workbook(filename='./tmp_test.xlsx')
-    sheet = workbook.active
-    last_row = sheet.max_row
-    sheet.cell(row=last_row+1, column=1, value=C_index)
-    sheet.cell(row=last_row+1, column=2, value=S_cal.item())
-    sheet.cell(row=last_row+1, column=3, value=D_cal.item())
-    sheet.cell(row=last_row+1, column=4, value=KS.item())
-    sheet.cell(row=last_row+1, column=5, value=KM_cal.item())
-    sheet.cell(row=last_row+1, column=6, value=IBS.item())
-    sheet.cell(row=last_row+1, column=7, value=KS_SUM.item())
-    sheet.cell(row=last_row+1, column=8, value=KS_VAR.item())
-    sheet.cell(row=last_row+1, column=9, value=PSR.item())
-    sheet.cell(row=last_row+1, column=10, value=(f'{args.dataset}_{args.model_dist}_CSD-iPOT'))
-    workbook.save('./tmp_test.xlsx')
-    # ci = []
-    # mae_hinge = []
-    # mae_po = []
-    # rmse_hinge = []
-    # rmse_po = []
-    # ibs = []
-    # km_cal = []
-    # xcal_stats = []
-
-    # c_index = evaler.concordance()[0]
-    # ibs_score = evaler.integrated_brier_score(num_points=10)
-    # hinge_abs = evaler.mae(method='Hinge', verbose=False)
-    # po_abs = evaler.mae(method='Pseudo_obs', verbose=False)
-    # hinge_sq = evaler.rmse(method='Hinge', verbose=False)
-    # po_sq = evaler.rmse(method='Pseudo_obs', verbose=False)
-    # km_cal_score = evaler.km_calibration()
-    # _, dcal_hist = evaler.d_calibration()
-    # xcal_score = xcal_from_hist(dcal_hist)
-
-    # ci.append(c_index)
-    # ibs.append(ibs_score)
-    # mae_hinge.append(hinge_abs)
-    # mae_po.append(po_abs)
-    # rmse_hinge.append(hinge_sq)
-    # rmse_po.append(po_sq)
-    # km_cal.append(km_cal_score)
-    # xcal_stats.append(xcal_score)
-
-    # print("concordance:", ci)
-    # print("IBS:", ibs)
-    # print("MAE_hinge:", mae_hinge)
-    # print("MAE_po:", mae_po)
-    # print("KM-CAL:", km_cal)
-    # print("X-cal:", xcal_stats)
-
 
 if __name__ == '__main__':
     parser = TestArgParser()
