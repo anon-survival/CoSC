@@ -15,6 +15,38 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 def safe_logit(x, eps=1e-6):
     return torch.log((x + eps) / (1 - x + eps))
 
+def normalized_rmst(cdf_matrix, time_grid, tau=None):
+    """Compute RMST/tau on a shared, sorted time grid."""
+    if cdf_matrix.ndim != 2 or time_grid.ndim != 1:
+        raise ValueError("cdf_matrix must be 2-D and time_grid must be 1-D")
+    if cdf_matrix.shape[1] != time_grid.numel():
+        raise ValueError("cdf_matrix columns must match time_grid")
+    if torch.any(time_grid[1:] < time_grid[:-1]):
+        raise ValueError("time_grid must be sorted")
+
+    if tau is None:
+        tau = time_grid[-1]
+    tau = torch.as_tensor(tau, dtype=time_grid.dtype, device=time_grid.device)
+    if tau <= 0:
+        raise ValueError("tau must be positive")
+
+    survival = 1 - cdf_matrix
+    before_tau = time_grid < tau
+    times = time_grid[before_tau]
+    survival_before = survival[:, before_tau]
+
+    right = torch.searchsorted(time_grid, tau).clamp(max=time_grid.numel() - 1)
+    left = (right - 1).clamp(min=0)
+    left_t, right_t = time_grid[left], time_grid[right]
+    fraction = ((tau - left_t) / (right_t - left_t).clamp_min(torch.finfo(time_grid.dtype).eps)).clamp(0, 1)
+    survival_tau = survival[:, left] + fraction * (survival[:, right] - survival[:, left])
+    survival_tau = torch.where(tau > time_grid[-1], survival[:, -1], survival_tau)
+
+    integration_times = torch.cat([time_grid.new_zeros(1), times, tau.reshape(1)])
+    integration_survival = torch.cat([survival.new_ones((survival.shape[0], 1)), survival_before, survival_tau.unsqueeze(1)], dim=1)
+
+    return torch.trapezoid(integration_survival, integration_times, dim=1) / tau
+
 def postprocessing(args, cdf, is_dead, device='cpu', max_iters=10000, tol=1e-8, patience=100):
     EPS = 1e-8
     order = torch.argsort(cdf)
@@ -63,7 +95,7 @@ def postprocessing(args, cdf, is_dead, device='cpu', max_iters=10000, tol=1e-8, 
             KS_error = torch.max(torch.concat([KS_upper, KS_lower], dim=1), dim=1).values
             KS = torch.max(KS_error)
 
-            print(f"KS: {KS.item():.5f}, Iteration: {iter+1}/{max_iters}", end="\r")
+            print(f"KS: {KS.item():.6f}, Iteration: {iter+1}/{max_iters}", end="\r")
 
             optimizer.zero_grad()
             KS.backward()
@@ -119,483 +151,89 @@ def postprocessing(args, cdf, is_dead, device='cpu', max_iters=10000, tol=1e-8, 
 
     return a0, b0, alpha
 
-def set_seed(seed=42):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+def ecdf(t, cdf, is_dead, weights=None, eps=1e-8):
+    """
+    t: 변환할 CDF 값, [N, T] 또는 임의 shape
+    cdf: calibration PIT, [N_cal]
+    is_dead: calibration event, [N_cal]
+    weights: calibration weights, [N_cal] 또는 [N, N_cal]
+    """
+    original_shape = t.shape
+    query = t.reshape(-1)
+    observed = cdf.reshape(-1)
+    event = is_dead.reshape(-1).float()
+    if observed.numel() != event.numel():
+        raise ValueError("cdf and is_dead must have the same number of elements")
 
-class ParamNet(nn.Module):
-    def __init__(self, input_dim=1, hidden_dim=8):
-        super().__init__()
+    order = torch.argsort(observed)
+    observed = observed[order]
+    event = event[order]
+    censor = 1 - event
+    inverse_survival = censor / (1 - observed).clamp_min(eps)
+    indices = torch.searchsorted(observed, query.contiguous(), right=True)
 
-        self.shared = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU()
-        )
+    def prefix_sum(values):
+        zero_shape = (*values.shape[:-1], 1)
+        return torch.cat([values.new_zeros(zero_shape), values.cumsum(dim=-1)], dim=-1)
 
-        self.a_head = nn.Linear(hidden_dim, 1)
-        self.b_head = nn.Linear(hidden_dim, 1)
-        self.alpha_head = nn.Linear(hidden_dim, 1)
+    if weights is None or weights.ndim == 1:
+        if weights is None:
+            sorted_weights = torch.ones_like(observed)
+        else:
+            if weights.numel() != observed.numel():
+                raise ValueError("1-D weights must match the calibration CDF length")
+            sorted_weights = weights.reshape(-1)[order]
 
-        # self.a = nn.Parameter(torch.tensor(0.0))
-        # self.b = nn.Parameter(torch.tensor(0.0))
-        # self.alpha = nn.Parameter(torch.tensor(0.0))
-
-    def forward(self, x):
-        h = self.shared(x)
-
-        a = F.softplus(self.a_head(h))
-        b = self.b_head(h)
-        alpha = F.softplus(self.alpha_head(h))
-
-        # a = torch.exp(self.a)
-        # b = self.b
-        # alpha = torch.exp(self.alpha)
-
-        return a, b, alpha
-    
-def kernel_postprocessing(args, cdf, cdf_matrix, is_dead, src, device='cpu', max_iters=10000, tol=1e-8, patience=200):
-    set_seed(42)
-
-    EPS = 1e-8
-    order = torch.argsort(cdf)
-    cdf = cdf[order].unsqueeze(1)
-    is_dead = is_dead[order].unsqueeze(1)
-    src = src[order]
-
-    h_raw = torch.nn.Parameter(torch.tensor(0.0, device=device))
-    # h_raw = torch.tensor(0.0, device=device)
-    sigma_raw = torch.nn.Parameter(torch.tensor(0.0, device=device))
-
-    model = ParamNet(input_dim=src.shape[1], hidden_dim=args.node).to(device)
-        
-    if args.use_kernel:
-        # optimizer = optim.AdamWScheduleFreePaper(list(model.parameters()) + [sigma_raw], lr=0.01)
-        optimizer = optim.AdamWScheduleFreePaper(list(model.parameters()) + [h_raw, sigma_raw], lr=0.03)
+        event_prefix = prefix_sum(sorted_weights * event)
+        censor_prefix = prefix_sum(sorted_weights * inverse_survival)
+        censor_cdf_prefix = prefix_sum(sorted_weights * inverse_survival * observed)
+        transformed = (
+            event_prefix[indices]
+            + query * censor_prefix[indices]
+            - censor_cdf_prefix[indices]
+        ) / sorted_weights.sum().clamp_min(eps)
     else:
-        optimizer = optim.AdamWScheduleFreePaper(list(model.parameters()) + [sigma_raw], lr=0.01)
-
-    best_ks = float('inf')
-    best_params = copy.deepcopy(model.state_dict())
-    patience_counter = 0
-
-    with torch.no_grad():
-        import gower
-        src_cpu = src.cpu().numpy()
-        dij = torch.from_numpy(gower.gower_matrix(src_cpu)).to(device)
-        alpha = args.n_quantile
-        dij_no_diag = dij.clone()
-        dij_no_diag.fill_diagonal_(float('inf'))
-        di = torch.quantile(dij_no_diag, alpha, dim=1, keepdim=True)
-        src_dist = dij / torch.sqrt(di * di.T + EPS)
-        # src_dist = dij
-        # h = torch.median(torch.triu(src_dist)[torch.triu(src_dist) != 0])
-
-    start_time = time.time()
-    optimizer.train()
-    for iter in range(max_iters):
-        with torch.set_grad_enabled(True):
-            a, b, alpha = model(src.float())
-
-            logit_cdf = safe_logit(cdf)
-            if args.dataset == 'sequence' and args.model_dist == 'lognormal':
-                logit_cdf = torch.clamp(logit_cdf, -7, 10)
-            F_unsorted = torch.sigmoid(a * logit_cdf + b) ** alpha
-            F_order = torch.argsort(F_unsorted.view(-1))
-            F_sorted = F_unsorted.view(-1)[F_order].view(-1, 1)
-            is_dead_sorted = is_dead.view(-1)[F_order].view(-1, 1)
-            is_alive = (1 - is_dead_sorted).float()
-
-            denom = 1 - F_sorted + EPS
-            weight = is_alive / denom
-            F_weight = F_sorted * weight
-
-            if args.use_kernel:
-                if args.sample:
-                    g = torch.Generator(device=device)
-                    g.manual_seed(42 + iter)
-                    idx = torch.randperm(cdf.shape[0], generator=g, device=device)[:args.B]
-                    src_dist_sorted = src_dist[F_order][:, F_order][:, idx]
-                else:
-                    src_dist_sorted = src_dist[F_order][:, F_order]
-
-                if args.kernel == 'laplacian':
-                    kernel_weight = torch.exp(-src_dist_sorted / torch.exp(h_raw)).to(device)
-                    # kernel_weight = torch.exp(-src_dist_sorted / h).to(device)
-                    kernel_weight = torch.clamp(kernel_weight, 0, 1)
-                else:
-                    kernel_weight = torch.exp(-src_dist_sorted / (2*torch.exp(h_raw)**2)).to(device)
-                    kernel_weight = torch.clamp(kernel_weight, 0, 1)
-                
-                kw = kernel_weight * weight
-                kf = kernel_weight * F_weight
-                ksum = torch.sum(kernel_weight, dim=0)
-
-                cum_weight = torch.cumsum(kw, dim=0)
-                cum_F_weight = torch.cumsum(kf, dim=0)
-
-                cum_weight_shifted = F.pad(cum_weight[:-1], (0, 0, 1, 0), value=0.0)
-                cum_F_weight_shifted = F.pad(cum_F_weight[:-1], (0, 0, 1, 0), value=0.0)
-
-                ecdf_cens = F_sorted * cum_weight_shifted - cum_F_weight_shifted
-                ecdf_cens = torch.clamp(ecdf_cens, min=torch.zeros_like(ecdf_cens), max=ksum)
-
-                ke = kernel_weight * is_dead_sorted
-                ecdf_dead = torch.cumsum(ke, dim=0)
-
-                ecdf_upper = (ecdf_dead + ecdf_cens) / ksum
-                ecdf_upper = torch.clamp(ecdf_upper, 0, 1)
-
-                ecdf_lower = ecdf_upper - ke / ksum
-
-            else:
-                cum_weight = torch.cumsum(weight, dim=0)
-                cum_F_weight = torch.cumsum(F_weight, dim=0)
-
-                cum_weight_shifted = F.pad(cum_weight[:-1], (0, 0, 1, 0), value=0.0)
-                cum_F_weight_shifted = F.pad(cum_F_weight[:-1], (0, 0, 1, 0), value=0.0)
-
-                ecdf_cens = F_sorted * cum_weight_shifted - cum_F_weight_shifted
-                ecdf_cens = torch.clamp(ecdf_cens, min=0, max=F_sorted.shape[0])
-
-                ecdf_dead = torch.cumsum(is_dead_sorted, dim=0)
-
-                ecdf_upper = (ecdf_dead + ecdf_cens) / cdf.shape[0]
-                ecdf_upper = torch.clamp(ecdf_upper, 0, 1)
-                
-                ecdf_lower = ecdf_upper - is_dead_sorted / cdf.shape[0]
-
-            KS_upper = torch.abs(ecdf_upper - F_sorted)
-            KS_lower = torch.abs(ecdf_lower - F_sorted)
-            KS_error = torch.max(torch.max(KS_upper, KS_lower), dim=0).values
-
-            # mono_penalty = rank_loss(args=args, cdf_before=cdf, cdf_after=F_unsorted, k=100, sigma_raw=sigma_raw, step=iter)
-            idx = torch.argsort(cdf.view(-1))
-            i = idx[:-1]
-            j = idx[1:]
-            diffs = F_unsorted.view(-1)[i] - F_unsorted.view(-1)[j]
-            mono_penalty = F.relu(diffs).mean()
-
-            # lambda_mono = max(0, 1 - iter / 10000)
-            # lambda_mono = torch.exp(- torch.tensor([iter/100], device=device))
-            # lambda_mono = 1/2 + 1/2 * np.cos(np.pi * (iter/400))
-            KS = torch.mean(KS_error) + mono_penalty
-            # if iter < 500:
-            #     KS = torch.mean(KS_error) + mono_penalty
-            # elif iter < 1000:
-            #     KS = torch.mean(KS_error) + 0.5*mono_penalty
-            # else:
-            #     KS = torch.mean(KS_error)
-
-            print(f"KS: {KS.item():.5f}, Iteration: {iter+1}/{max_iters}", end="\r")
-
-            best_h_raw = h_raw.clone().detach()
-            best_sigma_raw = sigma_raw.clone().detach()
-
-            if torch.isfinite(KS):
-                if KS.item() < best_ks:
-                    best_ks = KS.item()
-                    best_params = copy.deepcopy(model.state_dict())
-                    best_h_raw = h_raw.clone().detach()
-                    best_sigma_raw = sigma_raw.clone().detach()
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                    if patience_counter >= patience:
-                        print(f"\nEarly stopping at iteration {iter+1}. Best KS: {best_ks:.6f}")
-                        break
-            else:
-                print("\nNon-finite KS detected. Restoring best and stopping.")
-                break
-
-            optimizer.zero_grad()
-            KS.backward()
-
-            all_params = list(model.parameters())
-            if h_raw.requires_grad:
-                all_params.append(h_raw)
-            if sigma_raw.requires_grad:
-                all_params.append(sigma_raw)
-
-            grads = []
-            for p in model.parameters():
-                if p.grad is not None:
-                    grads.append(p.grad.view(-1))
-            if h_raw.grad is not None:
-                grads.append(h_raw.grad.view(-1))
-            if sigma_raw.grad is not None:
-                grads.append(sigma_raw.grad.view(-1))
-
-            if grads:
-                grad_vec = torch.cat(grads)
-                if not torch.isfinite(grad_vec).all():
-                    print("\nNon-finite gradient detected. Skipping this step.")
-                    optimizer.zero_grad()
-                    continue
-                grad_norm = torch.norm(grad_vec)
-            else:
-                grad_norm = torch.tensor(0.0, device=device)
-
-            if grad_norm < tol:
-                print(f"\nGradient norm below tolerance: {grad_norm:.6f}. Stopping early at iteration {iter+1}.")
-                break
-            
-            optimizer.step()
-
-    # optimizer.eval()
-    
-    end_time = time.time()
-    # workbook = load_workbook(filename='./ksp_time.xlsx')
-    # sheet = workbook.active
-    # last_row = sheet.max_row
-    # sheet.cell(row=last_row+1, column=1, value=(end_time-start_time))
-    # sheet.cell(row=last_row+1, column=2, value=(f'kernel_KSP_{args.dataset}_{args.model_dist}'))
-    # workbook.save('./ksp_time.xlsx')
-    
-    # workbook = load_workbook(filename='./total_iter.xlsx')
-    # sheet = workbook.active
-    # last_row = sheet.max_row
-    # sheet.cell(row=last_row+1, column=1, value=iter+1)
-    # sheet.cell(row=last_row+1, column=2, value=(f'kernel_KSP_{args.dataset}_{args.model_dist}'))
-    # workbook.save('./total_iter.xlsx')
-
-    print("---------------------------------------------------------------------")
-    print("sigma:", torch.exp(best_sigma_raw).item())
-    if args.use_kernel:
-        print("h:", torch.exp(best_h_raw).item())
-
-    # workbook = load_workbook(filename='./hyperparameter.xlsx')
-    # sheet = workbook.active
-    # last_row = sheet.max_row
-    # sheet.cell(row=last_row+1, column=1, value=torch.exp(best_sigma_raw).item())
-    # sheet.cell(row=last_row+1, column=2, value=torch.exp(best_h_raw).item())
-    # sheet.cell(row=last_row+1, column=3, value=(f'kernel_KSP_{args.dataset}_{args.model_dist}'))
-    # workbook.save('./hyperparameter.xlsx')
-
-    print("---------------------------------------------------------------------")
-    print("conditional KSP time:", end_time - start_time)
-    print("---------------------------------------------------------------------")
-
-    model.load_state_dict(best_params)
-
-    return model
-
-
-# def kernel_postprocessing(args, cdf, cdf_matrix, is_dead, src, device='cpu', max_iters=10000, tol=1e-8, patience=200):
-#     set_seed(42)
-
-#     EPS = 1e-8
-#     cdf = cdf.unsqueeze(1)
-#     is_dead = is_dead.unsqueeze(1)
-
-#     model = ParamNet(input_dim=src.shape[1], hidden_dim=args.node).to(device)
-#     sigma_raw = torch.nn.Parameter(torch.tensor(0.0, device=device))        
-
-#     optimizer = optim.AdamWScheduleFreePaper(list(model.parameters()) + [sigma_raw], lr=0.01)
-
-#     best_ks = float('inf')
-#     best_params = copy.deepcopy(model.state_dict())
-#     patience_counter = 0
-
-#     start_time = time.time()
-#     optimizer.train()
-#     for iter in range(max_iters):
-#         with torch.set_grad_enabled(True):
-#             a, b, alpha = model(src.float())
-
-#             logit_cdf = safe_logit(cdf)
-
-#             if args.dataset == 'sequence' and args.model_dist == 'lognormal':
-#                 logit_cdf = torch.clamp(logit_cdf, -7, 10)
-
-#             F_unsorted = torch.sigmoid(a * logit_cdf + b) ** alpha
-#             F_order = torch.argsort(F_unsorted.view(-1))
-#             F_sorted = F_unsorted.view(-1)[F_order]
-#             is_dead_sorted = is_dead.view(-1)[F_order]
-#             is_alive = (1 - is_dead_sorted).float()
-
-#             denom = 1 - F_sorted + EPS
-#             weight = is_alive / denom
-#             F_weight = F_sorted * weight
-            
-#             if args.use_kernel:
-#                 cdf_weight = torch.sigmoid(a * safe_logit(cdf_matrix.float()) + b) ** alpha
-
-#                 g = torch.Generator(device=device)
-#                 g.manual_seed(42 + iter)
-#                 idx = torch.randint(0, F_sorted.shape[0], (1,), generator=g, device=device)
-#                 # kernel_weight = torch.norm(cdf_weight - cdf_weight[idx, :], args.n_quantile, dim=1) / F_sorted.shape[0]
-#                 kernel_weight = torch.norm(cdf_weight - cdf_weight[idx, :], float('Inf'), dim=1) / F_sorted.shape[0]
-#                 kernel_weight = torch.exp(-kernel_weight)
-#                 kernel_weight = kernel_weight[F_order]
-
-#                 kw = kernel_weight * weight
-#                 kf = kernel_weight * F_weight
-
-#                 ksum = torch.sum(kernel_weight)
-
-#                 cum_weight = torch.cumsum(kw, dim=0)
-#                 cum_F_weight = torch.cumsum(kf, dim=0)
-
-#                 cum_weight_shifted = torch.cat([torch.zeros_like(cum_weight[:1]), cum_weight[:-1]], dim=0)
-#                 cum_F_weight_shifted = torch.cat([torch.zeros_like(cum_F_weight[:1]), cum_F_weight[:-1]], dim=0)
-
-#                 ecdf_cens = F_sorted * cum_weight_shifted - cum_F_weight_shifted
-#                 ecdf_cens = torch.clamp(ecdf_cens, min=torch.zeros_like(ecdf_cens), max=ksum)
-
-#                 ke = kernel_weight * is_dead_sorted
-#                 ecdf_dead = torch.cumsum(ke, dim=0)
-
-#                 ecdf_upper = (ecdf_dead + ecdf_cens) / ksum
-#                 ecdf_upper = torch.clamp(ecdf_upper, 0, 1)
-
-#                 ecdf_lower = ecdf_upper - ke / ksum
-
-#             else:
-#                 cum_weight = torch.cumsum(weight, dim=0)
-#                 cum_F_weight = torch.cumsum(F_weight, dim=0)
-
-#                 cum_weight_shifted = torch.cat([torch.zeros_like(cum_weight[:1]), cum_weight[:-1]], dim=0)
-#                 cum_F_weight_shifted = torch.cat([torch.zeros_like(cum_F_weight[:1]), cum_F_weight[:-1]], dim=0)
-
-#                 ecdf_cens = F_sorted * cum_weight_shifted - cum_F_weight_shifted
-#                 ecdf_cens = torch.clamp(ecdf_cens, min=0, max=F_sorted.shape[0])
-
-#                 ecdf_dead = torch.cumsum(is_dead_sorted, dim=0)
-
-#                 ecdf_upper = (ecdf_dead + ecdf_cens) / cdf.shape[0]
-#                 ecdf_upper = torch.clamp(ecdf_upper, 0, 1)
-                
-#                 ecdf_lower = ecdf_upper - is_dead_sorted / cdf.shape[0]
-
-#             KS_upper = torch.abs(ecdf_upper - F_sorted)
-#             KS_lower = torch.abs(ecdf_lower - F_sorted)
-#             KS_error = torch.max(torch.maximum(KS_upper, KS_lower))
-
-#             # diffs = F_unsorted - F_unsorted[idx].T
-#             # correct_order = (cdf < cdf[idx].T)
-#             # sigma = torch.exp(sigma_raw)
-#             # if args.rank == 'softplus':
-#             #     rank_loss = F.softplus(diffs/sigma)
-#             # else:
-#             #     rank_loss = torch.exp(diffs/sigma)
-#             # mono_penalty = (rank_loss*correct_order).mean()
-
-#             mono_penalty = rank_loss(args=args, cdf_before=cdf, cdf_after=F_unsorted, k=5, sigma_raw=sigma_raw, step=iter)
-
-#             KS = KS_error
-#             # KS = KS_error + mono_penalty
-
-#             print(f"KS: {KS.item():.5f}, Iteration: {iter+1}/{max_iters}", end="\r")
-
-#             best_sigma_raw = sigma_raw.clone().detach()
-
-#             if torch.isfinite(KS):
-#                 if KS.item() < best_ks:
-#                     best_ks = KS.item()
-#                     best_params = copy.deepcopy(model.state_dict())
-#                     best_sigma_raw = sigma_raw.clone().detach()
-#                     patience_counter = 0
-#                 else:
-#                     patience_counter += 1
-#                     if patience_counter >= patience:
-#                         print(f"\nEarly stopping at iteration {iter+1}. Best KS: {best_ks:.6f}")
-#                         break
-#             else:
-#                 print("\nNon-finite KS detected. Restoring best and stopping.")
-#                 break
-
-#             optimizer.zero_grad()
-#             KS.backward()
-
-#             all_params = list(model.parameters())
-#             if sigma_raw.requires_grad:
-#                 all_params.append(sigma_raw)
-
-#             grads = []
-#             for p in model.parameters():
-#                 if p.grad is not None:
-#                     grads.append(p.grad.view(-1))
-#             if sigma_raw.grad is not None:
-#                 grads.append(sigma_raw.grad.view(-1))
-
-#             if grads:
-#                 grad_vec = torch.cat(grads)
-#                 if not torch.isfinite(grad_vec).all():
-#                     print("\nNon-finite gradient detected. Skipping this step.")
-#                     optimizer.zero_grad()
-#                     continue
-#                 grad_norm = torch.norm(grad_vec)
-#             else:
-#                 grad_norm = torch.tensor(0.0, device=device)
-
-#             if grad_norm < tol:
-#                 print(f"\nGradient norm below tolerance: {grad_norm:.6f}. Stopping early at iteration {iter+1}.")
-#                 break
-            
-#             optimizer.step()
-
-#     # optimizer.eval()
-    
-#     end_time = time.time()
-#     # workbook = load_workbook(filename='./ksp_time.xlsx')
-#     # sheet = workbook.active
-#     # last_row = sheet.max_row
-#     # sheet.cell(row=last_row+1, column=1, value=(end_time-start_time))
-#     # sheet.cell(row=last_row+1, column=2, value=(f'kernel_KSP_{args.dataset}_{args.model_dist}'))
-#     # workbook.save('./ksp_time.xlsx')
-    
-#     # workbook = load_workbook(filename='./total_iter.xlsx')
-#     # sheet = workbook.active
-#     # last_row = sheet.max_row
-#     # sheet.cell(row=last_row+1, column=1, value=iter+1)
-#     # sheet.cell(row=last_row+1, column=2, value=(f'kernel_KSP_{args.dataset}_{args.model_dist}'))
-#     # workbook.save('./total_iter.xlsx')
-
-#     print("---------------------------------------------------------------------")
-#     print("sigma:", torch.exp(best_sigma_raw).item())
-
-#     # workbook = load_workbook(filename='./hyperparameter.xlsx')
-#     # sheet = workbook.active
-#     # last_row = sheet.max_row
-#     # sheet.cell(row=last_row+1, column=1, value=torch.exp(best_sigma_raw).item())
-#     # sheet.cell(row=last_row+1, column=2, value=torch.exp(best_h_raw).item())
-#     # sheet.cell(row=last_row+1, column=3, value=(f'kernel_KSP_{args.dataset}_{args.model_dist}'))
-#     # workbook.save('./hyperparameter.xlsx')
-
-#     print("---------------------------------------------------------------------")
-#     print("conditional KSP time:", end_time - start_time)
-#     print("---------------------------------------------------------------------")
-
-#     model.load_state_dict(best_params)
-
-#     return model
-
-# Random pair without replacement
-def rank_loss(args, cdf_before, cdf_after, k, sigma_raw, step, base_seed=42):
-    m = min(cdf_before.shape[0], k)
-
-    g = torch.Generator(device=cdf_before.device)
-    g.manual_seed(base_seed + step)
-
-    # j_idx = torch.randperm(cdf_before.shape[0], device=cdf_before.device)[:m]
-    k_idx = torch.randperm(cdf_before.shape[0], device=cdf_before.device, generator=g)[:m]
-
-    # diffs = cdf_after[j_idx] - cdf_after[k_idx].T
-    # correct_order = (cdf_before[j_idx] < cdf_before[k_idx].T)
-    diffs = cdf_after - cdf_after[k_idx].T
-    correct_order = (cdf_before < cdf_before[k_idx].T)
-
-    sigma = torch.exp(sigma_raw)
-
-    if args.rank == 'softplus':
-        rank_loss = F.softplus(diffs/sigma)
-    else:
-        rank_loss = torch.exp(diffs/sigma)
-
-    return (rank_loss*correct_order).mean()
+        if t.ndim != 2 or weights.ndim != 2:
+            raise ValueError("subject-specific weights require 2-D t and weights")
+        if weights.shape != (t.shape[0], observed.numel()):
+            raise ValueError("weights must have shape [n_subjects, n_calibration]")
+
+        sorted_weights = weights[:, order]
+        event_prefix = prefix_sum(sorted_weights * event)
+        censor_prefix = prefix_sum(sorted_weights * inverse_survival)
+        censor_cdf_prefix = prefix_sum(sorted_weights * inverse_survival * observed)
+        row_indices = torch.arange(t.shape[0], device=t.device).repeat_interleave(t.shape[1])
+        transformed = (
+            event_prefix[row_indices, indices]
+            + query * censor_prefix[row_indices, indices]
+            - censor_cdf_prefix[row_indices, indices]
+        ) / sorted_weights.sum(dim=1)[row_indices].clamp_min(eps)
+
+    return transformed.clamp(0, 1).reshape(original_shape)
+
+def marginal_censoring_km(observed, is_dead, query, left_limit=False, eps=1e-6):
+    """Evaluate the marginal KM survival function of the censoring variable."""
+    observed = observed.reshape(-1)
+    censor_event = (1 - is_dead.reshape(-1).float())
+    order = torch.argsort(observed)
+    sorted_observed = observed[order]
+    sorted_censor_event = censor_event[order]
+
+    unique_times, inverse, counts = torch.unique_consecutive(
+        sorted_observed, return_inverse=True, return_counts=True
+    )
+    censor_counts = sorted_observed.new_zeros(unique_times.numel())
+    censor_counts.scatter_add_(0, inverse, sorted_censor_event)
+    at_risk = observed.numel() - torch.cat(
+        [counts.new_zeros(1), counts.cumsum(0)[:-1]]
+    )
+    survival_after = torch.cumprod(
+        1 - censor_counts / at_risk.to(observed.dtype), dim=0
+    )
+    survival_prefix = torch.cat(
+        [survival_after.new_ones(1), survival_after]
+    )
+    indices = torch.searchsorted(
+        unique_times, query.contiguous(), right=not left_limit
+    )
+    return survival_prefix[indices].clamp_min(eps)
