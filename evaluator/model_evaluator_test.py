@@ -199,33 +199,6 @@ class ModelEvaluator_test(object):
             metrics[phase + '_' + 'KM-cal'] = km_calibration
             metrics[phase + '_' + 'IBS'] = IBS
             metrics[phase + '_' + 'PSR'] = cen_log_simple
-            if self.args.dataset in ['liver', 'stomach', 'bladder']:
-                labels_test = torch.load(f"./data/seer/{self.args.dataset}/{self.args.k}/{self.args.dataset}_test_labels.pt").to(DEVICE)
-                labels_test = labels_test[order_km]
-            else:
-                labels_test = torch.load(f"./data/{self.args.dataset}/{self.args.k}/{self.args.dataset}_test_labels.pt").to(DEVICE)
-                labels_test = labels_test[order_km]
-
-            KS_SUM, KS_VAR = util.groupwise_ks_metric(torch.diag(cdf_km), is_dead_km, labels_test)
-            metrics[phase + '_' + 'KS-sum'] = KS_SUM
-            metrics[phase + '_' + 'KS-var'] = KS_VAR
-
-            workbook = load_workbook(filename='./tmp_test.xlsx')
-            sheet = workbook.active
-            last_row = sheet.max_row
-            # sheet.cell(row=last_row+1, column=1, value=metrics[phase + '_' + 'loss'].item())
-            # sheet.cell(row=last_row+1, column=1, value=metrics[phase + '_' + 'NLL'])
-            sheet.cell(row=last_row+1, column=1, value=metrics[phase + '_' + 'concordance'].item())
-            sheet.cell(row=last_row+1, column=2, value=metrics[phase + '_' + 'S-cal(20)'].item())
-            sheet.cell(row=last_row+1, column=3, value=metrics[phase + '_' + 'D-cal(20)'].item())
-            sheet.cell(row=last_row+1, column=4, value=metrics[phase + '_' + 'KS'].item())
-            sheet.cell(row=last_row+1, column=5, value=metrics[phase + '_' + 'KM-cal'].item())
-            sheet.cell(row=last_row+1, column=6, value=metrics[phase + '_' + 'IBS'].item())
-            sheet.cell(row=last_row+1, column=7, value=metrics[phase + '_' + 'KS-sum'].item())
-            sheet.cell(row=last_row+1, column=8, value=metrics[phase + '_' + 'KS-var'].item())
-            sheet.cell(row=last_row+1, column=9, value=metrics[phase + '_' + 'PSR'].item())
-            sheet.cell(row=last_row+1, column=10, value=(f'{self.args.model_dist}_{self.args.dataset}_baseline_lam{self.args.lam}'))
-            workbook.save('./tmp_test.xlsx')
 
         print(' ---- {} epoch Concordance {:.4f}'.format(phase, concordance))
         print(' ---- {} epoch end S-cal(20) {:.5f}'.format(phase, approx_s_calibration))
