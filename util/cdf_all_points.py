@@ -2,7 +2,7 @@ import torch
 import util
 from saver import ModelSaver
 from lifelines.utils import concordance_index
-from util.postprocessing import safe_logit, ParamNet
+from util.postprocessing import safe_logit, normalized_rmst
 import torch.nn.functional as F
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -54,7 +54,7 @@ def cdf_all_points(args, phase='test'):
 
     return cdf_test, tte_test, is_dead_test, src_test, order_test
 
-def metric_after_ksp(args, cdf, train_tte, train_event, tte, is_dead, order_test, a, b, alpha):
+def metric_after_ksp(args, cdf, train_tte, train_event, tte, is_dead, order_test, src, a, b, alpha):
     with torch.no_grad():
         cdf = torch.sigmoid(a * safe_logit(cdf.float()) + b) ** alpha
 
@@ -77,14 +77,14 @@ def metric_after_ksp(args, cdf, train_tte, train_event, tte, is_dead, order_test
     for i in range(0, surv.shape[0], batch_size):
         integral[i:i+batch_size] = torch.trapezoid(surv[i:i+batch_size, :], tte2[i:i+batch_size, :])
 
-    if args.dataset in ['liver', 'stomach', 'bladder']:
-        labels_test = torch.load(f"./data/seer/{args.dataset}/{args.k}/{args.dataset}_test_labels.pt").to(DEVICE)
-        labels_test = labels_test[order_test]
-    else:
-        labels_test = torch.load(f"./data/{args.dataset}/{args.k}/{args.dataset}_test_labels.pt").to(DEVICE)
-        labels_test = labels_test[order_test]
+    # if args.dataset in ['liver', 'stomach', 'bladder']:
+    #     labels_test = torch.load(f"./data/seer/{args.dataset}/{args.k}/{args.dataset}_test_labels.pt").to(DEVICE)
+    #     labels_test = labels_test[order_test]
+    # else:
+    #     labels_test = torch.load(f"./data/{args.dataset}/{args.k}/{args.dataset}_test_labels.pt").to(DEVICE)
+    #     labels_test = labels_test[order_test]
 
-    KS_SUM, KS_VAR = groupwise_ks_metric(cdf_diag, is_dead, labels_test)
+    # KS_SUM, KS_VAR = groupwise_ks_metric(cdf_diag, is_dead, labels_test)
 
     C_index = concordance_index(tte.cpu(), integral.cpu(), is_dead.cpu())
     SCAL = util.s_calibration(points=cdf_diag, is_dead=is_dead, phase='test', args=args, device=DEVICE)
@@ -94,20 +94,11 @@ def metric_after_ksp(args, cdf, train_tte, train_event, tte, is_dead, order_test
     IBS = util.integrated_brier_score(train_tte=train_tte, train_event=train_event,
                                       test_tte=tte, test_event=is_dead, cdf_test=cdf, time=tte)
     PSR = util.cen_log_simple(tte=tte, is_dead=is_dead, cdf_matrix=cdf)
+    cal_ws = util.wsc_xcal(X=src, event_indicators=is_dead, predict_probs=1-cdf_diag)
 
-    return C_index, SCAL, DCAL, KS, KM_CAL, IBS, KS_SUM, KS_VAR, PSR
+    return C_index, SCAL, DCAL, KS, KM_CAL, IBS, PSR, cal_ws
 
-def metric_after_kernel_ksp(args, cdf, train_tte, train_event, tte, is_dead, order_test, src, params):
-    device = cdf.device
-    
-    model = ParamNet(input_dim=src.shape[1], hidden_dim=args.node).to(device)
-        
-    model.load_state_dict(params)
-    model.eval()
-    with torch.no_grad():
-        a0, b0, alpha = model(src.float())
-        cdf = torch.sigmoid(a0 * safe_logit(cdf.float()) + b0) ** alpha
-
+def metric_after_rmst_ksp(args, cdf, train_tte, train_event, tte, is_dead, order_test, src):
     cdf_diag = torch.diag(cdf)
 
     # calculate the mean
@@ -127,14 +118,14 @@ def metric_after_kernel_ksp(args, cdf, train_tte, train_event, tte, is_dead, ord
     for i in range(0, surv.shape[0], batch_size):
         integral[i:i+batch_size] = torch.trapezoid(surv[i:i+batch_size, :], tte2[i:i+batch_size, :])
 
-    if args.dataset in ['liver', 'stomach', 'bladder']:
-        labels_test = torch.load(f"./data/seer/{args.dataset}/{args.k}/{args.dataset}_test_labels.pt").to(DEVICE)
-        labels_test = labels_test[order_test]
-    else:
-        labels_test = torch.load(f"./data/{args.dataset}/{args.k}/{args.dataset}_test_labels.pt").to(DEVICE)
-        labels_test = labels_test[order_test]
+    # if args.dataset in ['liver', 'stomach', 'bladder']:
+    #     labels_test = torch.load(f"./data/seer/{args.dataset}/{args.k}/{args.dataset}_test_labels.pt").to(DEVICE)
+    #     labels_test = labels_test[order_test]
+    # else:
+    #     labels_test = torch.load(f"./data/{args.dataset}/{args.k}/{args.dataset}_test_labels.pt").to(DEVICE)
+    #     labels_test = labels_test[order_test]
         
-    KS_SUM, KS_VAR = groupwise_ks_metric(cdf_diag, is_dead, labels_test)
+    # KS_SUM, KS_VAR = groupwise_ks_metric(cdf_diag, is_dead, labels_test)
 
     C_index = concordance_index(tte.cpu(), integral.cpu(), is_dead.cpu())
     SCAL = util.s_calibration(points=cdf_diag, is_dead=is_dead, phase='test', args=args, device=DEVICE)
@@ -144,8 +135,9 @@ def metric_after_kernel_ksp(args, cdf, train_tte, train_event, tte, is_dead, ord
     IBS = util.integrated_brier_score(train_tte=train_tte, train_event=train_event,
                                       test_tte=tte, test_event=is_dead, cdf_test=cdf, time=tte)
     PSR = util.cen_log_simple(tte=tte, is_dead=is_dead, cdf_matrix=cdf)
+    cal_ws = util.wsc_xcal(X=src, event_indicators=is_dead, predict_probs=1-cdf_diag)
 
-    return C_index, SCAL, DCAL, KS, KM_CAL, IBS, KS_SUM, KS_VAR, PSR
+    return C_index, SCAL, DCAL, KS, KM_CAL, IBS, PSR, cal_ws
 
 def groupwise_ks_metric(cdf, is_dead, labels_test):
     EPS = 1e-8
