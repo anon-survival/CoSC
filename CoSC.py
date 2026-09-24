@@ -607,20 +607,10 @@ def PIT_cond(args):
 
     best_h, best_loss = _fit_bandwidth(args, cdf_valid, is_dead_valid, summary_valid, src_valid=src_valid)
 
-    # workbook = load_workbook(filename='./hyperparameter.xlsx')
-    # sheet = workbook.active
-    # last_row = sheet.max_row
-    # sheet.cell(row=last_row+1, column=1, value=best_h)
-    # sheet.cell(row=last_row+1, column=2, value=(f'PIT_cond_{args.dataset}_{args.model_dist}'))
-    # workbook.save('./hyperparameter.xlsx')
-
     print("Conditional PIT summary:", getattr(args, 'pit_cond_summary', 'rmst'))
     test_weights = _kernel_weights(summary_test, summary_valid, best_h, args.kernel)
     cdf_star = util.ecdf(t=cdf_test_all, cdf=cdf_valid, is_dead=is_dead_valid, weights=test_weights)
     end_time = time.time()
-
-    # import pandas as pd
-    # pd.DataFrame(cdf_star.cpu()).to_csv('./conditional_cdf.csv', index=False)
 
     rmst_ksp_result_test = util.metric_after_rmst_ksp(args=args, cdf=cdf_star, train_tte=tte_train, train_event=is_dead_train,
                                             tte=tte_test, is_dead=is_dead_test, order_test=order_test, src=src_test)
@@ -638,27 +628,6 @@ def PIT_cond(args):
     # print("KS-var:", rmst_ksp_result_test[7].item())
     print("PSR:", rmst_ksp_result_test[6].item())
     print("Cal_ws:", rmst_ksp_result_test[7].item())
-
-    # workbook = load_workbook(filename='./ksp_time.xlsx')
-    # sheet = workbook.active
-    # last_row = sheet.max_row
-    # sheet.cell(row=last_row+1, column=1, value=(end_time - start_time))
-    # sheet.cell(row=last_row+1, column=2, value=(f'PIT_cond_{args.dataset}_{args.model_dist}'))
-    # workbook.save('./ksp_time.xlsx')
-    
-    # workbook = load_workbook(filename='./tmp_test.xlsx')
-    # sheet = workbook.active
-    # last_row = sheet.max_row
-    # sheet.cell(row=last_row+1, column=1, value=rmst_ksp_result_test[0].item())
-    # sheet.cell(row=last_row+1, column=2, value=rmst_ksp_result_test[3].item())
-    # sheet.cell(row=last_row+1, column=3, value=rmst_ksp_result_test[4].item())
-    # sheet.cell(row=last_row+1, column=4, value=rmst_ksp_result_test[5].item())
-    # sheet.cell(row=last_row+1, column=5, value=rmst_ksp_result_test[6].item())
-    # sheet.cell(row=last_row+1, column=6, value=rmst_ksp_result_test[7].item())
-    # sheet.cell(row=last_row+1, column=7, value=rmst_ksp_result_test[8].item())
-    # sheet.cell(row=last_row+1, column=8, value=rmst_ksp_result_test[9].item())
-    # sheet.cell(row=last_row+1, column=9, value=(f'{args.dataset}_{args.model_dist}_PIT_cond2_grid'))
-    # workbook.save('./tmp_test.xlsx')
 
 if __name__ == '__main__':
     parser = TestArgParser()
